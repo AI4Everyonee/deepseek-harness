@@ -52,6 +52,8 @@ The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-a
 
 With the provider mounted, a command runs under the mode you resolve per call. Enforcement is a reported fact, not a promise: `full` means the backend governs every promised file effect, while `partial` means it governs only a subset — the Windows ACL rung (hard-link, unconfined-read, and AppContainer-ACL boundaries) and older Landlock ABIs are the current partial cases, so a consumer that requires an absolute boundary can reject or surface them. Denied file effects surface through the backend's denial dialect, and a runner that fails before executing the command reports a structured runner-failure signature.
 
+The [Paperclip managed execution policy](../sandbox/README.md#paperclip-managed-execution) requires the built-in Darwin ARM64 Seatbelt runner. Its explicit read grants and protected-path denials are enforced by the kernel for the command and descendants.
+
 ### Failures and recovery
 
 An unsupported platform or an unusable runner fails closed: `confine()` rejects with `SANDBOX_UNAVAILABLE` and names the runner options for the platform, and the consumer surfaces that error rather than running the command unconfined. A runner that starts but refuses its profile is identified by its fatal stderr signature and exit code, so a broken sandbox is not mistaken for a denied command. The `runnerCommand` override is an operator assertion: it skips functional probes and assumes the configured runner implements the bwrap-compatible profile honestly.

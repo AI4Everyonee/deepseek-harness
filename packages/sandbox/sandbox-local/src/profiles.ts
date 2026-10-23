@@ -4,8 +4,9 @@
  * @module @deepseek-ai/dsh-sandbox-local/profiles
  */
 
+import { dirname } from 'node:path'
 import { grantArgs as landlockGrantArgs } from '@deepseek-ai/node-addon-system/landlock-run'
-import { writableRoots } from '@deepseek-ai/dsh-sandbox'
+import { managedPath, writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 
 /**
@@ -50,9 +51,32 @@ function sbplString(path: string): string {
  */
 export function seatbeltProfileArgs(policy: SandboxPolicy): string[] {
   const forms = ['(version 1)', '(allow default)', '(deny file-write*)', `(allow file-write* (literal ${sbplString('/dev/null')}))`]
+  if (policy.readRoots !== undefined) {
+    const runtimeRoots = ['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/lib', '/System/Library']
+    const readRoots = [...new Set([...policy.readRoots, ...runtimeRoots].map(managedPath))]
+    forms.push('(deny process-info* (target others))', '(deny mach-priv-task-port)')
+    forms.push('(deny file-read*)')
+    const ancestors = new Set<string>()
+    for (const root of readRoots) {
+      let parent = dirname(root)
+      while (parent !== dirname(parent)) {
+        ancestors.add(parent)
+        parent = dirname(parent)
+      }
+    }
+    forms.push(`(allow file-read-metadata ${[...ancestors].map(path => `(literal ${sbplString(path)})`).join(' ')})`)
+    forms.push(`(allow file-read* ${readRoots.map(root => `(subpath ${sbplString(root)})`).join(' ')})`)
+    forms.push('(allow file-read* (literal "/") (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom") (literal "/private/etc/localtime"))')
+  }
   const roots = writableRoots(policy)
   if (roots.length > 0) {
     forms.push(`(allow file-write* ${roots.map(root => `(subpath ${sbplString(root)})`).join(' ')})`)
+  }
+  // Explicit denials must follow every grant: an allowed workspace can contain runtime credentials.
+  for (const root of policy.protectedPaths ?? []) {
+    for (const spelling of new Set([root, managedPath(root)])) {
+      forms.push(`(deny file-read* file-write* (subpath ${sbplString(spelling)}))`)
+    }
   }
   return ['-p', forms.join(' ')]
 }

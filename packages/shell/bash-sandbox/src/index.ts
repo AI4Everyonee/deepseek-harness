@@ -11,13 +11,12 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import type { ShellExecRequest, ShellExecSpec, ShellExecution, ShellProcess, ShellRunResult } from '@deepseek-ai/dsh-shell'
-import { SandboxUnavailableError } from '@deepseek-ai/dsh-sandbox'
+import { SandboxUnavailableError, managedExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type {
   ConfinedArgv,
   ConfinedSandboxMode,
   RunnerFailureRule,
   SandboxEnforcement,
-  SandboxExecutionPolicy,
   SandboxMode,
   SandboxPolicy,
 } from '@deepseek-ai/dsh-sandbox'
@@ -87,7 +86,22 @@ export class SandboxBashExecutor extends LocalBashExecutor {
   }
 
   override async execute(spec: ShellExecSpec): Promise<ShellExecution> {
-    const policy = spec.sandboxPolicy as SandboxExecutionPolicy
+    const policy = managedExecutionPolicy(spec.sandboxPolicy ?? this.ctx.sandboxPolicy.resolve())
+    const removedEnv: string[] = []
+    if (policy.readRoots !== undefined) {
+      // env -u also removes instruction variables inherited by the subprocess provider.
+      const env: Record<string, string> = { ...spec.env, ...spec.dshEnv }
+      if (env.PAPERCLIP_API_KEY === undefined && process.env.PAPERCLIP_API_KEY !== undefined) {
+        env.PAPERCLIP_API_KEY = process.env.PAPERCLIP_API_KEY
+      }
+      for (const key of new Set([...Object.keys(process.env), ...Object.keys(env)])) {
+        if (key !== 'PAPERCLIP_API_KEY' && /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH|INSTRUCTION|PROMPT|^PAPERCLIP_DEEPSEEK_|^NODE_OPTIONS$|^NODE_PATH$|^BASH_ENV$|^ENV$|^DYLD_|^LD_/i.test(key)) {
+          Reflect.deleteProperty(env, key)
+          removedEnv.push(key)
+        }
+      }
+      spec = { ...spec, env, dshEnv: undefined, sandboxPolicy: policy }
+    }
     const { mode } = policy
     if (mode === 'danger-full-access') {
       return SandboxBashExecutor.decorateResult(
@@ -97,7 +111,7 @@ export class SandboxBashExecutor extends LocalBashExecutor {
     }
     let confined: ConfinedArgv | undefined
     const ex = await this.executeArgv(spec, async (signal) => {
-      const prepared = await this.confine(spec.command, { ...policy, mode }, signal)
+      const prepared = await this.confine(spec.command, { ...policy, mode }, signal, removedEnv)
       signal.throwIfAborted()
       confined = prepared
       return prepared.argv
@@ -184,8 +198,9 @@ export class SandboxBashExecutor extends LocalBashExecutor {
    * @param signal - cancellation of confinement preparation.
    * @returns the provider's exact argv and settlement-classification facts.
    */
-  private confine(command: string, policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> {
-    return this.ctx.sandbox.confine(['bash', '-c', command], policy, signal)
+  private confine(command: string, policy: SandboxPolicy, signal?: AbortSignal, removedEnv: readonly string[] = []): Promise<ConfinedArgv> {
+    const argv = ['bash', '-c', command]
+    return this.ctx.sandbox.confine(removedEnv.length === 0 ? argv : ['/usr/bin/env', ...removedEnv.flatMap(key => ['-u', key]), ...argv], policy, signal)
   }
 }
 

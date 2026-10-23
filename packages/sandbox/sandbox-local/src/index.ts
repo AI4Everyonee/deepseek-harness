@@ -34,7 +34,7 @@ import {
 } from '@deepseek-ai/node-addon-system/landlock-run'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox'
+import { SandboxProvider, SandboxUnavailableError, canonicalPath, managedExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, ConfinedSandboxMode, RunnerFailureRule, SandboxEnforcement, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { AclWriteGrant, assertTempRootOutsideWorkspace, registerAclDiagnosisSkill, tempWriteSid, workspaceWriteSid } from '@deepseek-ai/dsh-sandbox-windows-acl'
@@ -324,7 +324,11 @@ export class LocalSandboxProvider extends SandboxProvider {
    */
   async confine(argv: readonly string[], policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> {
     signal?.throwIfAborted()
-    policy = { ...policy, workspaceRoot: canonicalPath(policy.workspaceRoot) }
+    const resolved = managedExecutionPolicy(policy)
+    policy = { ...resolved, mode: resolved.mode === 'danger-full-access' ? 'workspace-write' : resolved.mode, workspaceRoot: canonicalPath(policy.workspaceRoot) }
+    if (policy.readRoots !== undefined && this.runnerCommand !== undefined) {
+      throw new SandboxUnavailableError(policy.mode, 'custom runners cannot enforce Paperclip managed read grants')
+    }
     if (this.runnerCommand !== undefined) {
       return Promise.resolve<ConfinedArgv>({
         argv: [...this.runnerCommand, ...bwrapProfileArgs(policy), '--', ...argv],
@@ -334,6 +338,9 @@ export class LocalSandboxProvider extends SandboxProvider {
       })
     }
     const selected = this.selectRunner(policy.mode)
+    if (policy.readRoots !== undefined && selected.runner !== 'seatbelt') {
+      throw new SandboxUnavailableError(policy.mode, 'Paperclip managed read grants require Seatbelt')
+    }
     const runnerArgv = this.runnerArgv(selected.runner, policy)
     return Promise.resolve<ConfinedArgv>({
       argv: [...runnerArgv, '--', ...argv],

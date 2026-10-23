@@ -49,6 +49,8 @@ Load the package with a default mode; the fail-safe default is `read-only`, and 
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-sandbox-policy) is the exhaustive source for every accepted field and its JSDoc.
 
+The resolver applies the launcher's [Paperclip managed execution policy](../sandbox/README.md#paperclip-managed-execution) after every session or approved-mode override and validates managed configuration at load time.
+
 ### Switching a session's mode
 
 A session's mode can be switched at runtime through a UI policy control or an explicit switch; the switch is recorded in the session log and takes effect on the session's next confined call. The switch survives restart through replay, and each session keeps its own mode — two sessions never see each other's state. A switched session keeps its immutable workspace cwd as the writable boundary.

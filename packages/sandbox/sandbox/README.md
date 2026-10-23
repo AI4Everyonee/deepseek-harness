@@ -61,6 +61,12 @@ The mode names the file effects a command may perform; enforcement completeness 
 
 Enforcement is reported per call: `full` means the backend governs every promised file effect, while `partial` means an active backend or older kernel ABI governs only a subset — the Windows ACL rung and older Landlock ABIs are the current partial cases, so a consumer that requires the absolute boundary can reject or surface them.
 
+### Paperclip managed execution
+
+A launcher sets `PAPERCLIP_DEEPSEEK_READ_ROOTS` and `PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS` together as non-empty JSON arrays of absolute paths. An absent half, invalid list, or unsupported host fails closed. Managed execution currently supports Darwin ARM64 with Seatbelt only; custom runners are rejected. Both lists are resolved for each operation, including canonical symlink spellings and missing descendants. No process-global environment snapshot is retained.
+
+Managed reads are limited to explicit roots; protected paths reject reads and writes even beneath an allowed workspace. Escalation to `danger-full-access` resolves to `workspace-write` and cannot remove these restrictions. Writes stay inside the workspace; implicit platform temporary grants are disabled. The shell additionally reads system binary/library directories, required device literals, the root directory needed by Darwin's dynamic loader, and ancestor metadata needed for path traversal. Other-process inspection and privileged task-port access are denied. Trusted in-process credential loading remains outside the tool fence.
+
 ### Denied calls and escalation
 
 When a confined call is denied, the operation reports a denial marker naming the mode — `[sandbox: file access denied under <mode> mode]` — and, when the composition advertises escalation, an escalation hint. The model may retry the exact call once with `sandbox_permissions` (the narrowest wider mode that suffices) plus a `justification`; the approval service obtains consent for the operation. The request retains its audit reason and supplies English and Chinese presentation copy with the model's justification unchanged. Missing translations follow the locale service's fallback chain, ultimately English; requesters own their translated presentation text. A wider mode requires approval and applies to that one call only. Repeating the call's effective mode succeeds without approval; narrower targets remain invalid.

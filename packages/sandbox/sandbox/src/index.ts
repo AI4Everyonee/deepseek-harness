@@ -20,6 +20,7 @@ export {
 } from './escalation.ts'
 export type { EscalationApproval, EscalationApprover, EscalationOutcome, EscalationRequest } from './escalation.ts'
 export { canonicalPath, writableRoots } from './roots.ts'
+export { managedExecutionPolicy, managedPath } from './managed.ts'
 
 /**
  * File-effect policy for confined processes. `read-only` permits only required
@@ -38,6 +39,10 @@ export type ConfinedSandboxMode = Exclude<SandboxMode, 'danger-full-access'>
  * policy once before choosing the enforcement path.
  */
 export interface SandboxExecutionPolicy {
+  /** Explicit tool read grants; paired with protectedPaths in Paperclip managed execution. */
+  readRoots?: readonly string[]
+  /** Paths tools may neither read nor write, including through symlinks or escalation. */
+  protectedPaths?: readonly string[]
   /** The file-effect mode this execution runs under. */
   mode: SandboxMode
   /** Absolute root directory `workspace-write` may write under. */

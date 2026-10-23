@@ -39,6 +39,8 @@ Choose it when a deployment needs file-level confinement for Bash commands: the 
 | `workspace-write` | Writes only under the policy's workspace root plus `/tmp` (ephemeral under bwrap, the host `/tmp` under Landlock, `/private/tmp` plus the per-user temp dir under Seatbelt) |
 | `danger-full-access` | No confinement; the provider is never consulted, and results carry `sandbox: { mode, denied: false }` |
 
+Under [Paperclip managed execution](../../sandbox/sandbox/README.md#paperclip-managed-execution), every command remains confined across escalation. Provider credentials, instruction variables, startup hooks and dynamic-loader overrides are removed from ambient and explicit shell environments; the scoped `PAPERCLIP_API_KEY` can remain. The executor rechecks managed permissions immediately before execution.
+
 ### Minimal configuration
 
 The executor takes no sandbox configuration of its own: the default mode and workspace root come from `ctx.sandboxPolicy`, and the runner choice belongs to the `ctx.sandbox` provider. Its own config is the local executor's knobs verbatim; the generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-bash-sandbox) is the exhaustive source.

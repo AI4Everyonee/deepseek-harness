@@ -4,8 +4,8 @@
  * text-storage mechanics — resolve, stat, read/stream, list, the atomic
  * write and the read-match-write edit critical section — are the local
  * implementation's, verbatim; this package adds only the per-call POLICY fence
- * on the two mutations. Reads pass through untouched: every mode permits
- * reading.
+ * on mutations and managed observations. Paperclip managed calls restrict every
+ * read to explicit roots and reject protected paths regardless of escalation.
  *
  * The fence is a policy check in TRUSTED code over a MODEL-CONTROLLED path,
  * NOT a kernel boundary — the operations are the seam's own (open, rename),
@@ -30,8 +30,8 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import type { Config as LocalConfig } from '@deepseek-ai/dsh-fs-local'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
-import { writableRoots } from '@deepseek-ai/dsh-sandbox'
+import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsInfo, FsPathInfo, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import { managedExecutionPolicy, managedPath, writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { isPathUnder } from './containment.ts'
@@ -64,6 +64,64 @@ export class SandboxedFileSystem extends LocalFileSystem {
   /** The deployment default mode — the capability fact the tool layer reads to advertise escalation. */
   override get sandboxMode(): SandboxMode {
     return this.defaultMode
+  }
+
+  private async checkedRead(target: FsTarget, supplied?: SandboxExecutionPolicy): Promise<FsTarget> {
+    const policy = managedExecutionPolicy(supplied ?? this.ctx.sandboxPolicy.resolve())
+    if (policy.readRoots === undefined) return target
+    const fresh = await super.resolve(target.displayPath)
+    for (const root of policy.protectedPaths ?? []) {
+      if (await isPathUnder(fresh.targetKey, managedPath(root))) {
+        throw new FsError(`cannot access "${target.displayPath}": protected path`, 'FS_SANDBOX_DENIED')
+      }
+    }
+    for (const root of policy.readRoots) {
+      if (await isPathUnder(fresh.targetKey, managedPath(root))) return fresh
+    }
+    throw new FsError(`cannot read "${target.displayPath}": outside managed read roots`, 'FS_SANDBOX_DENIED')
+  }
+
+  override async stat(target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined> {
+    return super.stat(await this.checkedRead(target), signal)
+  }
+
+  override async lstat(path: string, opts?: { cwd?: string }, signal?: AbortSignal): Promise<FsPathInfo | undefined> {
+    await this.checkedRead(await super.resolve(path, opts))
+    return super.lstat(path, opts, signal)
+  }
+
+  override async readText(target: FsTarget, signal?: AbortSignal): Promise<string> {
+    return super.readText(await this.checkedRead(target), signal)
+  }
+
+  override async streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>> {
+    return super.streamText(await this.checkedRead(target), signal)
+  }
+
+  override async readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
+    return super.readBytes(await this.checkedRead(target), signal, maxBytes)
+  }
+
+  override async readByteRange(target: FsTarget, range: { offset: number; length: number }, signal?: AbortSignal): Promise<Uint8Array> {
+    return super.readByteRange(await this.checkedRead(target), range, signal)
+  }
+
+  override async listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {
+    const entries = await super.listDir(await this.checkedRead(target), signal)
+    const visible: FsDirEntry[] = []
+    for (const entry of entries) {
+      try {
+        await this.checkedRead(entry.target)
+        visible.push(entry)
+      } catch (error) {
+        if (!(error instanceof FsError) || error.code !== 'FS_SANDBOX_DENIED') throw error
+      }
+    }
+    return visible
+  }
+
+  override async watch(target: FsTarget, changed: (error?: Error) => void, signal: AbortSignal): Promise<() => Promise<void>> {
+    return super.watch(await this.checkedRead(target), changed, signal)
   }
 
   /**
@@ -120,7 +178,8 @@ export class SandboxedFileSystem extends LocalFileSystem {
    * and the escalation hint.
    */
   private async checkedTarget(target: FsTarget, sandboxPolicy?: SandboxExecutionPolicy): Promise<FsTarget> {
-    const policy = sandboxPolicy ?? this.ctx.sandboxPolicy.resolve()
+    const policy = managedExecutionPolicy(sandboxPolicy ?? this.ctx.sandboxPolicy.resolve())
+    target = await this.checkedRead(target, policy)
     const { mode } = policy
     if (mode === 'danger-full-access') return target
     if (mode === 'read-only') {

@@ -45,6 +45,8 @@ The backend's config is unchanged from the local backend's (`cwd` resolution def
 
 The effective mode comes from the calling session's override or escalation grant, falling back to the deployment default when neither is in force. `read-only` denies every mutation with the structured `FS_SANDBOX_DENIED`. `workspace-write` allows a mutation only when the target canonicalizes under the workspace root or a platform temp area (`/tmp`, `os.tmpdir()`) — the same writable set the Seatbelt profile grants. `danger-full-access` delegates unfenced.
 
+Paperclip managed execution also fences reads, byte ranges, streams, listings, metadata and watches. Protected children are omitted from directory listings. The [managed execution policy](../../sandbox/sandbox/README.md#paperclip-managed-execution) remains active across escalation; ordinary upstream behavior described here applies when managed permissions are absent.
+
 ### Observable success and failures
 
 Reads, listings, metadata, and read-only watches work exactly as with `fs-local`; the mutation fence does not restrict observation. A denied mutation returns an `FS_SANDBOX_DENIED` error carrying the effective mode; through the tools the model sees `[sandbox: file access denied under <mode> mode]` plus the one-approved-wider retry hint, identical to bash's denials. A session with an approved escalation may retry the same operation at a strictly wider mode for that one call.
