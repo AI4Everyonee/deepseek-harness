@@ -21,7 +21,7 @@ describe('Paperclip managed policy', () => {
     vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', protectedPaths)
     expect(() => managedExecutionPolicy(policy)).toThrow()
   })
-  it.each(['linux', 'win32'])('rejects unimplemented managed %s hosts', (platform) => {
+  it.each(['linux', 'win32'] as const)('rejects unimplemented managed %s hosts', (platform) => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue(platform)
     vi.stubEnv('PAPERCLIP_DEEPSEEK_READ_ROOTS', '["/workspace"]')
     vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', '["/secret"]')
