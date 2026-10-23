@@ -241,6 +241,8 @@ export function loadLayeredEnv(
 ): LaunchEnvironmentSnapshot {
   const home = resolveDshHome()
   const inherited = { ...process.env } as Record<string, string>
+  // Managed callers supply one explicit credential source; project files cannot add accounts.
+  if (process.env['PAPERCLIP_DEEPSEEK_MANAGED'] === '1') return createLaunchEnvironmentSnapshot([{ source: 'process', values: inherited }])
   // Parse both layers first: a rejection must not leave one file applied.
   const project = readEnvLayer(binName, cwd, warn, home)
   const user = home === resolve(cwd) ? undefined : readEnvLayer(binName, home, warn, home)

@@ -104,6 +104,23 @@ describe('loadLayeredEnv', () => {
     for (const name of NAMES) Reflect.deleteProperty(process.env, name)
   }
 
+  it('does not load project or home dotenv credentials for a managed invocation', () => {
+    const home = tmp()
+    const project = tmp()
+    writeFileSync(join(home, '.env'), `${NAMES[0]}=home-secret`)
+    writeFileSync(join(project, '.env'), `${NAMES[1]}=project-secret`)
+    clear()
+    vi.stubEnv('DSH_HOME', home)
+    vi.stubEnv('PAPERCLIP_DEEPSEEK_MANAGED', '1')
+    try {
+      const snapshot = loadLayeredEnv(NAME, project, vi.fn())
+      expect(snapshot.get(NAMES[0])).toBeUndefined()
+      expect(snapshot.get(NAMES[1])).toBeUndefined()
+      expect(process.env[NAMES[0]]).toBeUndefined()
+      expect(process.env[NAMES[1]]).toBeUndefined()
+    } finally { clear(); vi.unstubAllEnvs() }
+  })
+
   it('layers user under project under the inherited environment', () => {
     const home = tmp()
     const project = tmp()

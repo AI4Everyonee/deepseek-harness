@@ -11,7 +11,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { Buffer } from 'node:buffer'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
@@ -45,6 +45,7 @@ import {
   type SessionNotification,
   type Stream,
 } from '@agentclientprotocol/sdk'
+import type { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -77,6 +78,8 @@ export interface AcpConfig {
   provider?: string
   /** Model name for created agents. */
   model?: string
+  /** Exact literal instructions for the managed Paperclip deployment. */
+  paperclipInstructions?: string
   /** Maximum summaries returned by one session/list page. */
   sessionListPageSize?: number
   /** Runtime-only transport override; production uses stdio. */
@@ -86,6 +89,7 @@ export interface AcpConfig {
 export const Config: Schema<AcpConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
+  paperclipInstructions: Schema.string(),
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
 })
 
@@ -97,6 +101,21 @@ export const Config: Schema<AcpConfig> = Schema.object({
 export function apply(ctx: Context, config: AcpConfig): void {
   // ACP handlers execute outside this plugin's injection scope, so capture the
   // injected service during apply rather than reading it lazily in a callback.
+  let paperclipMeta: { paperclipDeepseekInstructions: { schema: string; digest: string; byteLength: number } } | undefined
+  if (config.paperclipInstructions !== undefined) {
+    const content = config.paperclipInstructions
+    if (!content.trim() || content.includes('\0') || Buffer.byteLength(content) > 256 * 1024) {
+      throw new Error('Paperclip instructions must be nonempty and at most 256 KiB')
+    }
+    const prompt: SystemPrompt | undefined = ctx.get('systemPrompt')
+    if (prompt === undefined) throw new Error('Paperclip instruction admission requires systemPrompt')
+    ctx.effect(() => prompt.section({ name: 'paperclip:governance', order: 100_000, text: content, interpolate: false }))
+    paperclipMeta = { paperclipDeepseekInstructions: {
+      schema: 'paperclip.deepseek.instructions.v1',
+      digest: `sha256:${createHash('sha256').update(content).digest('hex')}`,
+      byteLength: Buffer.byteLength(content),
+    } }
+  }
   const persistence = ctx.sessionPersistence
   const logger = ctx.logger
   const sessionListPageSize = resolveSessionListPageSize(config.sessionListPageSize)
@@ -185,6 +204,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
         agentCapabilities: {
+          ...(paperclipMeta === undefined ? {} : { loadSession: true }),
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
           sessionCapabilities: { close: {}, list: {}, resume: {} },
@@ -232,7 +252,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
         assertOpen()
-        return { sessionId, configOptions }
+        return { sessionId, configOptions, ...(paperclipMeta === undefined ? {} : { _meta: paperclipMeta }) }
       } catch (error: unknown) {
         sessions.delete(sessionId)
         await record.close('session/new activation failed')
@@ -284,7 +304,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
         }
         sessions.set(sessionId, record)
         try {
-          return { configOptions: await record.configOptions(signal) }
+          return { configOptions: await record.configOptions(signal), ...(paperclipMeta === undefined ? {} : { _meta: paperclipMeta }) }
         } catch (error: unknown) {
           sessions.delete(sessionId)
           await record.close('session/resume option discovery failed')
@@ -387,6 +407,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
     })
     .onRequest(methods.agent.session.new, ({ params, signal }) => implementation.newSession(params, signal))
     .onRequest(methods.agent.session.list, ({ params, signal }) => implementation.listSessions(params, signal))
+    .onRequest(methods.agent.session.load, ({ params, signal }) => {
+      if (paperclipMeta === undefined) throw invalidParams('session/load requires the managed Paperclip profile')
+      // Paperclip owns transcript replay; restore the native session without replaying effects.
+      return implementation.resumeSession(params, signal)
+    })
     .onRequest(methods.agent.session.resume, ({ params, signal }) => implementation.resumeSession(params, signal))
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
