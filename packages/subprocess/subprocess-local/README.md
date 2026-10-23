@@ -48,6 +48,12 @@ Collect mode keeps the last `maxBytes` of a stream in memory — errors and fina
 
 The `./output` export shares this collector and retained-spill storage with process adapters. `snapshot()` returns the retained raw bytes and total byte count, allowing remote adapters to preserve offsets without forwarding the complete stream.
 
+### Managed Darwin parent lifetime
+
+With `PAPERCLIP_DEEPSEEK_MANAGED=1` on Darwin, ordinary commands run beneath a private group leader with an IPC lease to the harness. The target receives its ordinary streams and optional control fd 7, never the lease. If the harness dies, lease disconnection makes the still-live leader kill its own group. Parent cancellation also travels over this channel, so cleanup does not signal a stored PID that could have been reused. Direct outcomes and stdin retain their ordinary semantics; the lease owner stays until background group members finish. Managed Seatbelt commands cannot signal the trusted supervisor outside their sandbox. Standalone profiles keep their existing platform selection.
+
+The lease governs the owned process group. It does not add a Darwin kernel primitive that contains descendants deliberately escaping into another session, nor survive an external kill of the trusted supervisor itself.
+
 ### Control transport
 
 An ordinary spawn can request the [subprocess control pipe](../subprocess/README.md#using-a-control-pipe). A Node target receives fd 7 on every supported host; Windows descriptor numbering requires CRT initialization. POSIX runners preserve that descriptor across `execve`; Windows Job and ACL runners establish it in the child's CRT startup table before Node initializes and close their own carrier copies after spawning. Standard streams and the runner's private management channel remain independent.

@@ -50,6 +50,7 @@ import { targetEnvironment } from './runner-launch.ts'
 import { createProcessInspector } from './process-inspector.ts'
 import type { ProcessInspector } from './process-inspector.ts'
 import { LocalTerminalHandle } from './terminal.ts'
+import { launchDarwinLease } from './darwin-lease.ts'
 import { prepareShellActivity } from './shell-activity.ts'
 
 const requireNodePty = createLazyRequire<typeof NodePty>('node-pty', import.meta.url)
@@ -200,7 +201,9 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     const containmentMode = this.selectContainmentMode('ordinary')
     let handle: LocalSubprocessHandle
     const internals: SpawnInternals = { ...this.internals, onSpillFailure: this.reportSpillFailure }
-    if (containmentMode === 'fallback') {
+    if (process.platform === 'darwin' && process.env.PAPERCLIP_DEEPSEEK_MANAGED === '1') {
+      handle = bindManagedProcess(spec, launchDarwinLease(spec, env), internals)
+    } else if (containmentMode === 'fallback') {
       handle = spawnSubprocess(spec, internals)
     } else {
       const binding = prepareManagedProcessBinding(internals)

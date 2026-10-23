@@ -1,5 +1,7 @@
 /** One-shot Linux exec bootstrap and Windows Job-owning subprocess runner. */
 
+import { DARWIN_LEASE_SELECTION } from './darwin-lease.ts'
+import { runDarwinLease } from './darwin-lease-runner.ts'
 import { SUBPROCESS_CONTROL_FD } from '@deepseek-ai/dsh-subprocess/control'
 import { closeSync } from 'node:fs'
 import {
@@ -454,6 +456,10 @@ export async function runSpawnRunner(
 ): Promise<void> {
   Reflect.deleteProperty(host.env, SUBPROCESS_RUNNER_ENV)
   const targetArgv = parseRunnerTargetArgv(argv)
+  if (selection === DARWIN_LEASE_SELECTION) {
+    await runDarwinLease(targetArgv)
+    return
+  }
   if (selection === WINDOWS_RUNNER_SELECTION) {
     await new WindowsJobRunner(targetArgv, host, internals).run()
     return
@@ -472,7 +478,7 @@ export async function reportSpawnRunnerFailure(
   error: unknown,
   host: RunnerHost = process,
 ): Promise<void> {
-  if (selection === WINDOWS_RUNNER_SELECTION) {
+  if (selection === WINDOWS_RUNNER_SELECTION || selection === DARWIN_LEASE_SELECTION) {
     try { await sendMessage(host, { type: 'error', error: serializeRunnerError(error) }) } catch { /* No transport remains. */ }
     host.exitCode = 127
     if (host.connected) host.disconnect()

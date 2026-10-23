@@ -55,6 +55,7 @@ export function seatbeltProfileArgs(policy: SandboxPolicy): string[] {
     const runtimeRoots = ['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/lib', '/System/Library']
     const readRoots = [...new Set([...policy.readRoots, ...runtimeRoots].map(managedPath))]
     forms.push('(deny process-info* (target others))', '(deny mach-priv-task-port)')
+    forms.push('(deny signal)', '(allow signal (target self) (target same-sandbox))')
     forms.push('(deny file-read*)')
     const ancestors = new Set<string>()
     for (const root of readRoots) {

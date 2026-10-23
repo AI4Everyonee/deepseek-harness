@@ -123,5 +123,7 @@ describe.skipIf(!hostSupported)('managed Darwin tool processes', () => {
     const inspected = await run('/bin/ps eww -p "$PPID"')
     expect(inspected.exitCode).not.toBe(0)
     expect(inspected.stdout.text).not.toContain('synthetic-provider-key')
+    const signalled = await run('kill -0 "$PPID"')
+    expect(signalled.exitCode).not.toBe(0)
   })
 })
