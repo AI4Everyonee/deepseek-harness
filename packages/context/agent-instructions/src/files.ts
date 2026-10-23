@@ -7,6 +7,7 @@
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { FsError } from '@deepseek-ai/dsh-fs'
 import type { FileSystem, FsInfo, FsTarget, FsVersion } from '@deepseek-ai/dsh-fs'
 import { agentsHomeDisplay, dshHomeDisplay } from '@deepseek-ai/dsh-home-paths'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
@@ -226,8 +227,8 @@ async function existsAsMarker(path: string, fileSystem?: FileSystem, signal?: Ab
  * @param markers - child names that identify a project root.
  * @param fileSystem - optional provider used instead of host filesystem probes.
  * @param signal - cancellation for provider and host probes.
- * @returns the discovered project root, or `cwd` when no marker exists.
- * @throws the original marker metadata error or cancellation reason when a probe is unavailable.
+ * @returns the discovered project root, or `cwd` when no marker exists or the provider denies ancestor discovery.
+ * @throws the original metadata error or cancellation reason for failures other than sandbox denial.
  */
 export async function findProjectRoot(
   cwd: string,
@@ -238,7 +239,14 @@ export async function findProjectRoot(
   let current = resolve(cwd)
   for (;;) {
     for (const marker of markers) {
-      if (await existsAsMarker(join(current, marker), fileSystem, signal)) return current
+      try {
+        if (await existsAsMarker(join(current, marker), fileSystem, signal)) return current
+      } catch (error) {
+        signal?.throwIfAborted()
+        // A forbidden ancestor does not authorize discovery of broader project instructions.
+        if (error instanceof FsError && error.code === 'FS_SANDBOX_DENIED') return resolve(cwd)
+        throw error
+      }
     }
     const parent = dirname(current)
     if (parent === current) return resolve(cwd)
