@@ -35,8 +35,8 @@ function parseRoots(raw: string | undefined, name: string): string[] {
 }
 
 /**
- * Apply the launcher's managed grants and prevent escalation beyond workspace writes.
- * Both environment lists must be present and valid. Managed hosts currently require Darwin ARM64.
+ * Apply launcher grants, capped by DSH_PERMISSION_MODE even after approval.
+ * Both path lists and the permission mode must be valid. Managed hosts require Darwin ARM64.
  * @param policy - resolved ordinary policy, which cannot override launcher grants.
  * @returns policy with launch permissions applied, or the unchanged upstream policy when unmanaged.
  */
@@ -48,6 +48,10 @@ export function managedExecutionPolicy(policy: SandboxExecutionPolicy): SandboxE
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw new Error('Paperclip managed tool isolation requires Darwin ARM64')
   }
+  const launchMode = process.env.DSH_PERMISSION_MODE
+  if (launchMode !== 'read-only' && launchMode !== 'workspace-write' && launchMode !== 'danger-full-access') {
+    throw new Error('Paperclip managed execution requires a valid DSH_PERMISSION_MODE')
+  }
   const readRoots = reads === undefined && protectedRoots === undefined
     ? policy.readRoots
     : parseRoots(reads, 'PAPERCLIP_DEEPSEEK_READ_ROOTS')
@@ -57,7 +61,7 @@ export function managedExecutionPolicy(policy: SandboxExecutionPolicy): SandboxE
   if (readRoots === undefined || protectedPaths === undefined) throw new Error('Paperclip managed execution requires both readRoots and protectedPaths')
   return {
     ...policy,
-    mode: policy.mode === 'danger-full-access' ? 'workspace-write' : policy.mode,
+    mode: launchMode === 'read-only' || policy.mode === 'read-only' ? 'read-only' : 'workspace-write',
     readRoots,
     protectedPaths,
   }

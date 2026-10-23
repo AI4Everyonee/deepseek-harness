@@ -31,6 +31,7 @@ describe.skipIf(!hostSupported)('managed Darwin tool processes', () => {
     await writeFile(join(outside, 'outside.txt'), 'outside-secret')
     await symlink(outside, join(workspace, 'escape'))
     await symlink(protectedRoot, join(workspace, 'alias'))
+    vi.stubEnv('DSH_PERMISSION_MODE', 'workspace-write')
     vi.stubEnv('PAPERCLIP_DEEPSEEK_READ_ROOTS', JSON.stringify([workspace]))
     vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', JSON.stringify([protectedRoot, join(workspace, 'auth.json')]))
     ctx = new Context()
@@ -70,6 +71,29 @@ describe.skipIf(!hostSupported)('managed Darwin tool processes', () => {
     }
     expect(await readFile(join(protectedRoot, '.credentials.yaml'), 'utf8')).toBe('synthetic-secret')
     expect(await readFile(join(workspace, 'auth.json'), 'utf8')).toBe('synthetic-auth-secret')
+  })
+
+  it.each(['workspace-write', 'danger-full-access'] as const)('caps a read-only deployment against supplied %s escalation', async (mode) => {
+    vi.stubEnv('DSH_PERMISSION_MODE', 'read-only')
+    await ctx.fiber.dispose()
+    ctx = new Context()
+    await ctx.plugin(LocalSandboxProvider, {})
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(SandboxPolicyService, { mode: 'read-only', workspaceRoot: workspace })
+    await ctx.plugin(LocalSubprocessRuntime)
+    await ctx.plugin(SandboxBashExecutor, { cwd: workspace, timeoutMs: 5000 })
+    bash = ctx.shell as SandboxBashExecutor
+    await writeFile(join(workspace, 'existing.txt'), 'original')
+    const edited = await run('printf changed > existing.txt', mode)
+    expect(edited.exitCode).not.toBe(0)
+    expect(edited.sandbox).toMatchObject({ mode: 'read-only', denied: true, enforcement: 'full' })
+    const created = await run('printf denied > new.txt', mode)
+    expect(created.exitCode).not.toBe(0)
+    expect(await readFile(join(workspace, 'existing.txt'), 'utf8')).toBe('original')
+    await expect(readFile(join(workspace, 'new.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
+    const read = await run('/bin/cat existing.txt', mode)
+    expect(read.exitCode).toBe(0)
+    expect(read.stdout.text).toBe('original')
   })
 
   it('preserves read-only and denies reads and writes outside explicit grants, including platform temp', async () => {

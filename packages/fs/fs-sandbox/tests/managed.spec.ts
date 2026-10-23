@@ -28,6 +28,7 @@ beforeEach(async () => {
   await writeFile(join(outside, 'auth.json'), 'synthetic-auth-secret')
   await symlink(outside, join(workspace, 'escape'))
   await symlink(protectedRoot, join(workspace, 'alias'))
+  vi.stubEnv('DSH_PERMISSION_MODE', 'workspace-write')
   vi.stubEnv('PAPERCLIP_DEEPSEEK_READ_ROOTS', JSON.stringify([workspace]))
   vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', JSON.stringify([protectedRoot, join(outside, 'auth.json')]))
   ctx = new Context()
@@ -87,6 +88,25 @@ describe('managed filesystem grants', () => {
       .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
     await fs.writeText(await fs.resolve('allowed.txt'), 'allowed', undefined, undefined, full)
     expect(await fs.readText(await fs.resolve('allowed.txt'))).toBe('allowed')
+  })
+
+  it.each(['workspace-write', 'danger-full-access'] as const)('caps a read-only deployment against supplied %s escalation', async (mode) => {
+    vi.stubEnv('DSH_PERMISSION_MODE', 'read-only')
+    await ctx.fiber.dispose()
+    ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(SandboxPolicyService, { mode: 'read-only', workspaceRoot: workspace })
+    await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
+    fs = ctx.fs as SandboxedFileSystem
+    await writeFile(join(workspace, 'existing.txt'), 'original')
+    const policy = { mode, workspaceRoot: workspace }
+    await expect(fs.writeText(await fs.resolve('new.txt'), 'denied', undefined, undefined, policy))
+      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    await expect(fs.editText(await fs.resolve('existing.txt'), {
+      oldString: 'original', newString: 'changed', replaceAll: false,
+    }, undefined, undefined, policy)).rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
+    expect(await fs.readText(await fs.resolve('existing.txt'))).toBe('original')
+    await expect(readFile(join(workspace, 'new.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('preserves read-only mode and excludes the implicit platform temp grant', async () => {

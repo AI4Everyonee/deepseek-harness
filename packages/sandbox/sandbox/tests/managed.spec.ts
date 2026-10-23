@@ -1,7 +1,8 @@
 /** Launcher permission parsing fails closed and does not retain process environment snapshots. */
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { managedExecutionPolicy } from '../src/managed.ts'
 const policy = { mode: 'danger-full-access' as const, workspaceRoot: '/workspace' }
+beforeEach(() => { vi.stubEnv('DSH_PERMISSION_MODE', 'workspace-write') })
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks() })
 
 describe('Paperclip managed policy', () => {
@@ -26,6 +27,14 @@ describe('Paperclip managed policy', () => {
     vi.stubEnv('PAPERCLIP_DEEPSEEK_READ_ROOTS', '["/workspace"]')
     vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', '["/secret"]')
     expect(() => managedExecutionPolicy(policy)).toThrow('requires Darwin ARM64')
+  })
+  it.each([undefined, '', 'approve-all', 'Read-Only'])('rejects invalid managed permission mode %s', (mode) => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
+    vi.spyOn(process, 'arch', 'get').mockReturnValue('arm64')
+    vi.stubEnv('PAPERCLIP_DEEPSEEK_READ_ROOTS', '["/workspace"]')
+    vi.stubEnv('PAPERCLIP_DEEPSEEK_PROTECTED_ROOTS', '["/secret"]')
+    vi.stubEnv('DSH_PERMISSION_MODE', mode)
+    expect(() => managedExecutionPolicy(policy)).toThrow('DSH_PERMISSION_MODE')
   })
   it('reads current environment per execution and clamps full access', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin')
