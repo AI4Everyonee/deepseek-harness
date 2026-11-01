@@ -562,6 +562,10 @@ export interface GenerateOptions {
    * to separate cursors; adapters may map it to model-hidden transport metadata.
    */
   sessionId?: Branded<'SessionId'>
+  /** Turn number of the agent step issuing this request; omitted outside an agent step. Sent as `x-dsh-turn`. */
+  turn?: number
+  /** Step number within {@link turn} (restarts at 1 each turn); omitted outside an agent step. Sent as `x-dsh-step`. */
+  step?: number
   /**
    * Provider-neutral classification for an auxiliary model call. Adapters may
    * map the purpose to model-hidden transport metadata. Ordinary conversation

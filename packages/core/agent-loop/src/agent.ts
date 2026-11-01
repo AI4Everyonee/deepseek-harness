@@ -731,6 +731,8 @@ export class ReactLoopAgent implements Agent {
       toolHistory: session.toolHistory(),
       ...header.tools !== undefined ? { tools: header.tools } : {},
       sessionId: this.session.id,
+      turn: position.turn,
+      step: position.step,
       signal,
     }))
     return request

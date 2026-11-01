@@ -39,6 +39,7 @@ import type {
 } from '@earendil-works/pi-ai'
 import {
   attributionHeaders,
+  requestIdentityHeaders,
   contentHasImage,
   LlmAdapter,
   LlmError,
@@ -214,9 +215,12 @@ function reasoningInfo(
 }
 
 /** Merge deployment headers while removing case-insensitive attribution collisions. */
-function requestHeaders(headers: Readonly<Record<string, string>> | undefined): Record<string, string> {
-  const attribution = attributionHeaders()
-  const reserved = new Set(Object.keys(attribution).map(name => name.toLowerCase()))
+function requestHeaders(
+  headers: Readonly<Record<string, string>> | undefined,
+  options: GenerateOptions,
+): Record<string, string> {
+  const attribution = { ...attributionHeaders(), ...requestIdentityHeaders(options) }
+  const reserved = new Set([...Object.keys(attribution), 'x-dsh-session-id', 'x-dsh-turn', 'x-dsh-step'].map(name => name.toLowerCase()))
   return {
     ...Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !reserved.has(name.toLowerCase()))),
     ...attribution,
@@ -421,7 +425,7 @@ export class PiAiAdapter extends LlmAdapter {
         signal: watchdog.signal,
         // Profile headers are deployment-owned; attribution names are
         // Harness-owned and therefore win collisions.
-        headers: requestHeaders(profile.headers),
+        headers: requestHeaders(profile.headers, options),
       })
       const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
       let exhausted = false

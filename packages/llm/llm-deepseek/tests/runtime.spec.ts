@@ -1227,6 +1227,33 @@ describe('DeepSeekAdapter against a mock server', () => {
     expect(server.headers[0]?.['x-deepseek-harness-user-id']).toBe(getOrCreateAnonymousUserId())
   })
 
+  it('sends x-dsh identity headers, repeating them on a retried request and omitting turn/step outside a step', async () => {
+    const server = await mockServer([
+      { kind: 'sse', events: textEvents }, { kind: 'sse', events: textEvents }, { kind: 'sse', events: textEvents },
+    ])
+    const ctx = await harness(server.url)
+    const base = {
+      model: 'deepseek-v4-flash',
+      messages: [createUserMessage({
+        content: [{ type: 'text' as const, text: 'hi' }],
+        source: { kind: 'model' as const, provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+      })],
+      sessionId: SessionId('identity-session'),
+    }
+    await assemble(ctx, { ...base, turn: 2, step: 1 })
+    await assemble(ctx, { ...base, turn: 2, step: 1 })
+    await assemble(ctx, base)
+
+    for (const index of [0, 1]) {
+      expect(server.headers[index]).toMatchObject({
+        'x-dsh-session-id': 'identity-session', 'x-dsh-turn': '2', 'x-dsh-step': '1', 'x-api-key': 'test-key',
+      })
+    }
+    expect(server.headers[2]?.['x-dsh-session-id']).toBe('identity-session')
+    expect(server.headers[2]).not.toHaveProperty('x-dsh-turn')
+    expect(server.headers[2]).not.toHaveProperty('x-dsh-step')
+  })
+
   it('marks the auxiliary compaction call on the wire', async () => {
     const server = await mockServer([{ kind: 'sse', events: textEvents }])
     const ctx = await harness(server.url)
