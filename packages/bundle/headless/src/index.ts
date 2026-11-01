@@ -436,7 +436,7 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
     if (failure !== undefined) throw failure.error
     const outcome = summarize(agent.session, firstSeq)
     if (projection === undefined) io.stdout.write(outcome.text + '\n')
-    else projection.finish(outcome.text, outcome.reason)
+    else await projection.finish(outcome.text, outcome.reason)
     if (outcome.reason?.kind === 'error') {
       io.stderr.write(`dsh: ${outcome.reason.error.code}: ${outcome.reason.error.message}\n`)
     }

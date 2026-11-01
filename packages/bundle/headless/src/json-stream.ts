@@ -7,12 +7,29 @@
  * @module @deepseek-ai/dsh-headless/json-stream
  */
 
+import { createHash } from 'node:crypto'
+import { readFile, stat } from 'node:fs/promises'
+import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { lastAssistantStreamChunk } from '@deepseek-ai/dsh-llm/assistant-stream'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SpillStore } from '@deepseek-ai/dsh-spill'
 
-/** Default per-string and per-key cap applied to every bounded projected payload. */
+/**
+ * Default per-string and per-key cap applied to every bounded projected payload.
+ *
+ * The cap stays fixed. When it cuts a `tool_result`'s `result`, the event
+ * (already `truncated: true`) also carries
+ * `fullOutput: { path, bytes, sha256 }`: the absolute path of a private file in
+ * session-scoped spill storage holding the complete result text (UTF-8), its
+ * byte length, and the lowercase hex SHA-256 of those bytes. A result whose
+ * text already names a spill file (a spill-policy notice) points at that file,
+ * which holds the original unabridged output, instead of a second copy. When
+ * no `spillStore` is composed or the write fails, `fullOutput` is omitted and
+ * the event keeps `truncated: true`. `fullOutput` is never bounded.
+ */
 export const MAX_STRING_BYTES = 8 * 1024
 
 /** Default cap on one projected event's serialized bytes, newline included; the terminal `final` is exempt. */
@@ -37,8 +54,11 @@ export interface JsonProjectionOptions {
 
 /** The live handle of one `--json` projection. */
 export interface JsonProjection {
-  /** Write the answer and durable turn reason; omission reports no terminal turn. */
-  finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void
+  /**
+   * Write the answer and durable turn reason; omission reports no terminal turn.
+   * The promise settles once the line is written, after any pending tool result.
+   */
+  finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): Promise<void>
   /** Stop observing the Session. */
   dispose(): void
 }
@@ -135,17 +155,59 @@ export function boundJsonLine(
   maxEventBytes: number = MAX_EVENT_BYTES,
 ): string {
   const limit = maxEventBytes - LINE_TERMINATOR_BYTES
-  const bounded = boundJsonEvent(event, maxStringBytes)
+  // `fullOutput` is a short pointer that must reach the supervisor intact, so
+  // it bypasses the string bound and survives the structured-field drop.
+  const { fullOutput, ...rest } = event
+  const bounded = boundJsonEvent(rest, maxStringBytes)
+  if (fullOutput !== undefined) bounded.fullOutput = fullOutput
   const line = JSON.stringify(bounded)
   if (Buffer.byteLength(line, 'utf8') <= limit) return line
   const scalars = Object.create(null) as Record<string, unknown>
   for (const [key, value] of Object.entries(bounded)) {
     if (value === null || typeof value !== 'object') scalars[key] = value
   }
+  if (fullOutput !== undefined) scalars.fullOutput = fullOutput
   scalars.truncated = true
   const short = JSON.stringify(scalars)
   if (Buffer.byteLength(short, 'utf8') <= limit) return short
   return JSON.stringify({ type: bounded.type, truncated: true })
+}
+
+/** Pointer to the complete text of a truncated tool result. */
+interface FullOutput {
+  path: string
+  bytes: number
+  sha256: string
+}
+
+/** Text preceding the locator in a spill-policy notice. */
+const SPILL_LOCATION = ' Full formatted result stored at: '
+
+/** Describe one text or file content as a {@link FullOutput}. */
+function describeContent(path: string, content: Buffer | string): FullOutput {
+  const buffer = typeof content === 'string' ? Buffer.from(content, 'utf8') : content
+  return { path, bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') }
+}
+
+/**
+ * Find the spill file a spill-policy notice in `text` names, if it exists.
+ * The locator is followed by `. <hint>`, so each `. ` is tried as its end.
+ */
+async function existingSpillFile(text: string): Promise<FullOutput | undefined> {
+  const start = text.lastIndexOf(SPILL_LOCATION)
+  if (start < 0) return undefined
+  const tail = text.slice(start + SPILL_LOCATION.length)
+  for (let end = tail.indexOf('. '); end >= 0; end = tail.indexOf('. ', end + 1)) {
+    const path = tail.slice(0, end)
+    if (!isAbsolute(path)) continue
+    try {
+      if (!(await stat(path)).isFile()) continue
+      return describeContent(path, await readFile(path))
+    } catch {
+      // Not a readable file; a longer prefix of the notice may still be the path.
+    }
+  }
+  return undefined
 }
 
 /**
@@ -249,10 +311,51 @@ export function projectJsonRun(
 ): JsonProjection {
   const maxStringBytes = options.maxStringBytes ?? MAX_STRING_BYTES
   let disposed = false
+  // A line waits behind any pending spill write so order is preserved; with
+  // nothing pending it is written synchronously.
+  let pending = 0
+  let tail: Promise<void> = Promise.resolve()
+  const toolNames = new Map<string, string>()
   let stepUsage: StepUsageState = { usage: undefined, complete: true }
 
+  const emit = (line: string | Promise<string>): Promise<void> => {
+    if (pending === 0 && typeof line === 'string') {
+      sink.write(line)
+      return tail
+    }
+    pending++
+    tail = tail.then(async () => { sink.write(await line) }).finally(() => { pending-- })
+    return tail
+  }
+
   const write = (event: Record<string, unknown>): void => {
-    sink.write(`${boundJsonLine(event, maxStringBytes)}\n`)
+    void emit(`${boundJsonLine(event, maxStringBytes)}\n`)
+  }
+
+  /** Locate or write the complete text; undefined when neither succeeds. */
+  const persistFullOutput = async (text: string, callId: string): Promise<FullOutput | undefined> => {
+    try {
+      const existing = await existingSpillFile(text)
+      if (existing !== undefined) return existing
+      const store: SpillStore | undefined = ctx.get('spillStore')
+      if (store === undefined) return undefined
+      const ref = await store.saveText({
+        owner: { sessionId: agent.session.header.id },
+        source: { kind: 'tool', toolName: toolNames.get(callId) ?? 'tool', callId: callId as ToolCallId, label: 'result' },
+        suggestedName: 'tool-result.txt',
+        content: text,
+      })
+      return describeContent(ref.locator, text)
+    } catch {
+      // Best effort: the event keeps `truncated: true` without a pointer.
+      return undefined
+    }
+  }
+
+  const writeToolResult = (event: Record<string, unknown>, text: string, callId: string): void => {
+    if (Buffer.byteLength(text, 'utf8') <= maxStringBytes) { write(event); return }
+    void emit(persistFullOutput(text, callId).then(fullOutput =>
+      `${boundJsonLine(fullOutput === undefined ? event : { ...event, fullOutput }, maxStringBytes)}\n`))
   }
 
   const onSessionEvent = (session: unknown, event: SessionEvent): void => {
@@ -291,6 +394,7 @@ export function projectJsonRun(
         write({ type: 'status', phase: 'turn_end', turn: event.data.turn, reason: event.data.reason })
         return
       case 'tool/call':
+        toolNames.set(event.data.callId, event.data.name)
         write({
           type: 'tool_call',
           callId: event.data.callId,
@@ -303,13 +407,14 @@ export function projectJsonRun(
         // not this run's output, and would otherwise duplicate a callId.
         if (event.surfaceOp !== 'append') return
         const message = event.data.message
-        write({
+        const result = resultText(message.content)
+        writeToolResult({
           type: 'tool_result',
           callId: message.toolCallId,
           status: message.isError === true ? 'error' : 'completed',
-          result: resultText(message.content),
+          result,
           ...event.data.error === undefined ? {} : { error: event.data.error },
-        })
+        }, result, message.toolCallId)
         return
       }
       default:
@@ -321,10 +426,10 @@ export function projectJsonRun(
   const stopSession = ctx.on('session/event', onSessionEvent)
 
   return {
-    finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void {
+    finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): Promise<void> {
       // The answer is the lossless terminal contract, so it is not truncated.
-      if (disposed) return
-      sink.write(`${JSON.stringify({ type: 'final', sessionId: agent.id, reason: reason ?? null, text })}\n`)
+      if (disposed) return Promise.resolve()
+      return emit(`${JSON.stringify({ type: 'final', sessionId: agent.id, reason: reason ?? null, text })}\n`)
     },
     dispose(): void {
       disposed = true
