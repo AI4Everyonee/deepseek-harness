@@ -66,3 +66,20 @@ export function attributionHeaders(
 ): Record<string, string> {
   return { 'user-agent': userAgent(identity) }
 }
+
+/**
+ * Build the request-identity headers every provider request carries so a proxy
+ * or observability layer can attribute it to an agent step. Carries no content.
+ * @param options - request identity; `turn` and `step` are sent only when both are set.
+ * @returns `x-dsh-session-id` when a session is known, plus `x-dsh-turn` and `x-dsh-step` inside an agent step.
+ */
+export function requestIdentityHeaders(
+  options: { readonly sessionId?: string; readonly turn?: number; readonly step?: number },
+): Record<string, string> {
+  return {
+    ...options.sessionId === undefined ? {} : { 'x-dsh-session-id': options.sessionId },
+    ...options.turn === undefined || options.step === undefined
+      ? {}
+      : { 'x-dsh-turn': String(options.turn), 'x-dsh-step': String(options.step) },
+  }
+}

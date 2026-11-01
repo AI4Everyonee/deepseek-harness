@@ -135,6 +135,7 @@ File detection reads current content, including tool-role result content, on eve
 - **Prepared calls are one-shot** — a prepared call can be dispatched exactly once, and its call-config fields must match the prepared config.
 - **Image projection follows the captured route** — durable `ImageBlock` references become route-specific request versions only for image-capable models; text-only models receive stable placeholders.
 - **File projection is unconditional** — no provider receives file bytes; every route gets one deterministic handle line per `FileBlock`, and the model reads the saved copy with its file tools on demand.
+- **Requests carry their identity** — every provider HTTP request sends `x-dsh-session-id`, plus `x-dsh-turn` and `x-dsh-step` when issued by an agent step (the numbers the step events report; `step` restarts at 1 each turn). A retried step repeats the same values; `GenerateOptions.turn`/`step` are omitted outside a step. The headers never carry content or replace provider authentication; adapters add them with `requestIdentityHeaders()`.
 - **Protocol ordering** — `usage` precedes `finish`, tool arguments stay raw JSON strings, and nothing follows the terminal `finish`.
 - **Registry mutations are atomic** — route and directory registration validates the whole candidate set before anything moves, so a refused change leaves the previous state serving.
 

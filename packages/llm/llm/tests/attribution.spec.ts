@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
-import { APP_IDENTITY, attributionHeaders, userAgent } from '@deepseek-ai/dsh-llm'
+import { APP_IDENTITY, attributionHeaders, requestIdentityHeaders, userAgent } from '@deepseek-ai/dsh-llm'
 import type { AppIdentity } from '@deepseek-ai/dsh-llm'
 
 const manifest = createRequire(import.meta.url)('../package.json') as { version: string }
@@ -47,5 +47,14 @@ describe('attributionHeaders', () => {
     expect(attributionHeaders(forkIdentity)).toEqual({
       'user-agent': 'fork-agent/9.9.9 (+https://example.com/fork-agent)',
     })
+  })
+})
+
+describe('requestIdentityHeaders', () => {
+  it('sends the session with turn and step, and only the session outside a step', () => {
+    expect(requestIdentityHeaders({ sessionId: 's1', turn: 2, step: 1 }))
+      .toEqual({ 'x-dsh-session-id': 's1', 'x-dsh-turn': '2', 'x-dsh-step': '1' })
+    expect(requestIdentityHeaders({ sessionId: 's1' })).toEqual({ 'x-dsh-session-id': 's1' })
+    expect(requestIdentityHeaders({})).toEqual({})
   })
 })

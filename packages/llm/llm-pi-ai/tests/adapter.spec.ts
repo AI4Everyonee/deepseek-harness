@@ -12,6 +12,7 @@ import type {
 import LlmRuntime, { createToolResultMessage, createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, ReasoningEffortId, userAgent } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { DEFAULT_MAX_REQUEST_IMAGE_BYTES, resolveProfiles } from '../src/config.ts'
@@ -122,6 +123,21 @@ describe('PiAiAdapter provider routing', () => {
     await assemble(ctx, { model: 'deepseek-flash', messages: [] })
     expect(server.headers[0]?.['x-company']).toBe('private')
     expect(server.headers[0]?.['user-agent']).toBe(userAgent())
+  })
+
+  it('sends x-dsh identity headers inside a step and only the session outside one', async () => {
+    const server = await mockServer([{ events: textEvents }, { events: textEvents }])
+    const ctx = await harness(server.url, { headers: { 'X-Dsh-Turn': 'spoofed' } })
+    const sessionId = SessionId('identity-session')
+    await assemble(ctx, { model: 'deepseek-flash', messages: [], sessionId, turn: 3, step: 2 })
+    await assemble(ctx, { model: 'deepseek-flash', messages: [], sessionId })
+
+    expect(server.headers[0]).toMatchObject({
+      'x-dsh-session-id': 'identity-session', 'x-dsh-turn': '3', 'x-dsh-step': '2',
+    })
+    expect(server.headers[1]?.['x-dsh-session-id']).toBe('identity-session')
+    expect(server.headers[1]).not.toHaveProperty('x-dsh-turn')
+    expect(server.headers[1]).not.toHaveProperty('x-dsh-step')
   })
 
   it('forwards common stream options and profile reasoning', async () => {
