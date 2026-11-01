@@ -1266,6 +1266,38 @@ describe('headless runner', () => {
     await test.ctx.fiber.dispose()
   })
 
+  it('writes a pending fullOutput tool_result before the error line when the run fails', async () => {
+    const test = await bench({
+      async afterPrompt(session, message, agent) {
+        session.append('turn/start', { turn: 1 })
+        session.append('user/message', message, { surfaceOp: 'append' })
+        session.append('tool/result', {
+          turn: 1,
+          step: 1,
+          message: createToolResultMessage({
+            callId: ToolCallId('call-1'),
+            content: [{ type: 'text', text: 'x'.repeat(40_000) }],
+            isError: false,
+          }),
+        }, { surfaceOp: 'append' })
+        agent.ctx.emit('agent/error', { agent, turn: 1, step: 1, error: new Error('model boom') })
+        await Promise.resolve()
+      },
+    }, { json: true })
+    test.ctx.provide('spillStore', {
+      saveText: async (input: { content: string }) => {
+        await new Promise(resolve => setTimeout(resolve, 30))
+        return { locator: '/spill/out.txt', bytes: Buffer.byteLength(input.content), retrievalHint: 'Use read.' }
+      },
+    } as never)
+    const result = await test.run()
+    const events = result.out.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(events.map(event => event.type)).toEqual(['session', 'status', 'tool_result', 'error'])
+    expect(events[2]).toMatchObject({ fullOutput: { path: '/spill/out.txt' } })
+    expect(result.code).toBe(1)
+    await test.ctx.fiber.dispose()
+  })
+
   it('reports a direct Agent creation failure', async () => {
     const ctx = new Context()
     let err = ''

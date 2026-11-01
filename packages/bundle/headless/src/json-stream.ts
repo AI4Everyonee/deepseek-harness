@@ -7,12 +7,31 @@
  * @module @deepseek-ai/dsh-headless/json-stream
  */
 
+import { createHash } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { lastAssistantStreamChunk } from '@deepseek-ai/dsh-llm/assistant-stream'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { SpillStore } from '@deepseek-ai/dsh-spill'
 
-/** Default per-string and per-key cap applied to every bounded projected payload. */
+/**
+ * Default per-string and per-key cap applied to every bounded projected payload.
+ *
+ * The cap stays fixed. When it cuts a `tool_result`'s `result`, the event
+ * (already `truncated: true`) also carries
+ * `fullOutput: { path, bytes, sha256 }`: the absolute path of a private file in
+ * session-scoped spill storage holding the complete tool result text exactly
+ * as the model received it (UTF-8, before this stream's cap), its byte length,
+ * and the lowercase hex SHA-256 of those bytes. The file is always written
+ * fresh and the result text is never parsed or reused as a path: when
+ * spill-policy already replaced a large result with a preview plus notice, the
+ * file holds that preview plus notice, and the original stays in spill
+ * storage. When no `spillStore` is composed, the write fails, or the store
+ * returns a non-absolute locator, `fullOutput` is omitted and the event keeps
+ * `truncated: true`. `fullOutput` is never bounded.
+ */
 export const MAX_STRING_BYTES = 8 * 1024
 
 /** Default cap on one projected event's serialized bytes, newline included; the terminal `final` is exempt. */
@@ -33,14 +52,27 @@ export interface JsonProjectionOptions {
   cwd?: string
   /** Per-string and per-key byte cap; longer values are truncated and flagged. */
   maxStringBytes?: number
+  /**
+   * Receives each sink write or queued-line failure. Later lines still write;
+   * the failed line is lost. Defaults to ignoring the report.
+   */
+  onWriteError?: (error: unknown) => void
 }
 
 /** The live handle of one `--json` projection. */
 export interface JsonProjection {
-  /** Write the answer and durable turn reason; omission reports no terminal turn. */
-  finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void
+  /**
+   * Write the answer and durable turn reason; omission reports no terminal turn.
+   * The promise settles once the line is written, after any pending tool result.
+   */
+  finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): Promise<void>
   /** Stop observing the Session. */
   dispose(): void
+  /**
+   * Resolve once every line queued so far, including one waiting on a spill
+   * write, has been written or reported. Never rejects.
+   */
+  settled(): Promise<void>
 }
 
 /** Mutable truncation state threaded through one payload bound. */
@@ -122,8 +154,9 @@ function boundJsonEvent(
  * capped at `maxStringBytes`, and the serialized line at `maxEventBytes`. The
  * line cap reserves the newline the writer appends, so the complete record
  * stays within it. When the line is still too long, scalar fields survive and
- * structured fields are dropped; when even those are too long, only `type` and
- * `truncated` remain.
+ * structured fields are dropped; when even those are too long, only `type`,
+ * `callId`, `status`, `fullOutput` and `truncated` remain; as a last resort only
+ * `type` and `truncated`.
  * @param event - the event payload to serialize.
  * @param maxStringBytes - per-string and per-key byte cap.
  * @param maxEventBytes - cap on the serialized line plus its trailing newline.
@@ -135,17 +168,45 @@ export function boundJsonLine(
   maxEventBytes: number = MAX_EVENT_BYTES,
 ): string {
   const limit = maxEventBytes - LINE_TERMINATOR_BYTES
-  const bounded = boundJsonEvent(event, maxStringBytes)
+  // `fullOutput` is a short pointer that must reach the supervisor intact, so
+  // it bypasses the string bound and survives the structured-field drop.
+  const { fullOutput, ...rest } = event
+  const bounded = boundJsonEvent(rest, maxStringBytes)
+  if (fullOutput !== undefined) bounded.fullOutput = fullOutput
   const line = JSON.stringify(bounded)
   if (Buffer.byteLength(line, 'utf8') <= limit) return line
   const scalars = Object.create(null) as Record<string, unknown>
   for (const [key, value] of Object.entries(bounded)) {
     if (value === null || typeof value !== 'object') scalars[key] = value
   }
+  if (fullOutput !== undefined) scalars.fullOutput = fullOutput
   scalars.truncated = true
   const short = JSON.stringify(scalars)
   if (Buffer.byteLength(short, 'utf8') <= limit) return short
+  // Escape-heavy text can push even the scalars past the cap; keep only the
+  // identifying fields and the `fullOutput` pointer so the result stays findable.
+  const identity = Object.create(null) as Record<string, unknown>
+  for (const key of ['type', 'callId', 'status']) {
+    if (bounded[key] !== undefined) identity[key] = bounded[key]
+  }
+  if (fullOutput !== undefined) identity.fullOutput = fullOutput
+  identity.truncated = true
+  const kept = JSON.stringify(identity)
+  if (Buffer.byteLength(kept, 'utf8') <= limit) return kept
   return JSON.stringify({ type: bounded.type, truncated: true })
+}
+
+/** Pointer to the complete text of a truncated tool result. */
+interface FullOutput {
+  path: string
+  bytes: number
+  sha256: string
+}
+
+/** Describe one text content as a {@link FullOutput}. */
+function describeContent(path: string, content: string): FullOutput {
+  const buffer = Buffer.from(content, 'utf8')
+  return { path, bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') }
 }
 
 /**
@@ -155,17 +216,19 @@ export function boundJsonLine(
 function parseArguments(raw: string): unknown {
   if (raw === '') return {}
   const seen = { nonFinite: false }
+  let parsed: unknown
   try {
-    const parsed: unknown = JSON.parse(raw, (_key, value: unknown) => {
+    parsed = JSON.parse(raw, (_key, value: unknown) => {
       // `1e400` is valid JSON but parses to Infinity, which JSON.stringify
       // reports as null; keep the raw text rather than misdescribe the call.
       if (typeof value === 'number' && !Number.isFinite(value)) seen.nonFinite = true
       return value
     })
-    return seen.nonFinite ? raw : parsed
-  } catch {
+  } catch (_error) {
+    // Invalid JSON is not a failure here: the call is described by its raw text.
     return raw
   }
+  return seen.nonFinite ? raw : parsed
 }
 
 /** Join the text blocks of a tool result's model-facing content. */
@@ -249,10 +312,65 @@ export function projectJsonRun(
 ): JsonProjection {
   const maxStringBytes = options.maxStringBytes ?? MAX_STRING_BYTES
   let disposed = false
+  // A line waits behind any pending spill write so order is preserved; with
+  // nothing pending it is written synchronously.
+  let pending = 0
+  let tail: Promise<void> = Promise.resolve()
+  const toolNames = new Map<string, string>()
   let stepUsage: StepUsageState = { usage: undefined, complete: true }
 
+  const report = (error: unknown): void => {
+    try { options.onWriteError?.(error) } catch (_error) {
+      // A throwing reporter must not stop later lines, and nothing else can receive its failure.
+    }
+  }
+
+  const writeLine = (line: string): void => {
+    try { sink.write(line) } catch (error) { report(error) }
+  }
+
+  const emit = (line: string | Promise<string>): Promise<void> => {
+    if (pending === 0 && typeof line === 'string') {
+      writeLine(line)
+      return tail
+    }
+    pending++
+    // Each link absorbs its own failure so one lost line never blocks the
+    // lines chained behind it.
+    tail = tail
+      .then(async () => { writeLine(await line) })
+      .catch(report)
+      .finally(() => { pending-- })
+    return tail
+  }
+
   const write = (event: Record<string, unknown>): void => {
-    sink.write(`${boundJsonLine(event, maxStringBytes)}\n`)
+    void emit(`${boundJsonLine(event, maxStringBytes)}\n`)
+  }
+
+  /** Write the complete result text as the model received it; undefined when that fails. */
+  const persistFullOutput = async (text: string, callId: string): Promise<FullOutput | undefined> => {
+    const store: SpillStore | undefined = ctx.get('spillStore')
+    if (store === undefined) return undefined
+    let ref: Awaited<ReturnType<SpillStore['saveText']>>
+    try {
+      ref = await store.saveText({
+        owner: { sessionId: agent.session.header.id },
+        source: { kind: 'tool', toolName: toolNames.get(callId) ?? 'tool', callId: callId as ToolCallId, label: 'result' },
+        suggestedName: 'tool-result.txt',
+        content: text,
+      })
+    } catch (_error) {
+      // Best effort: the event keeps `truncated: true` without a pointer.
+      return undefined
+    }
+    return isAbsolute(ref.locator) ? describeContent(ref.locator, text) : undefined
+  }
+
+  const writeToolResult = (event: Record<string, unknown>, text: string, callId: string): void => {
+    if (Buffer.byteLength(text, 'utf8') <= maxStringBytes) { write(event); return }
+    void emit(persistFullOutput(text, callId).then(fullOutput =>
+      `${boundJsonLine(fullOutput === undefined ? event : { ...event, fullOutput }, maxStringBytes)}\n`))
   }
 
   const onSessionEvent = (session: unknown, event: SessionEvent): void => {
@@ -291,6 +409,7 @@ export function projectJsonRun(
         write({ type: 'status', phase: 'turn_end', turn: event.data.turn, reason: event.data.reason })
         return
       case 'tool/call':
+        toolNames.set(event.data.callId, event.data.name)
         write({
           type: 'tool_call',
           callId: event.data.callId,
@@ -303,13 +422,14 @@ export function projectJsonRun(
         // not this run's output, and would otherwise duplicate a callId.
         if (event.surfaceOp !== 'append') return
         const message = event.data.message
-        write({
+        const result = resultText(message.content)
+        writeToolResult({
           type: 'tool_result',
           callId: message.toolCallId,
           status: message.isError === true ? 'error' : 'completed',
-          result: resultText(message.content),
+          result,
           ...event.data.error === undefined ? {} : { error: event.data.error },
-        })
+        }, result, message.toolCallId)
         return
       }
       default:
@@ -321,14 +441,17 @@ export function projectJsonRun(
   const stopSession = ctx.on('session/event', onSessionEvent)
 
   return {
-    finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): void {
+    finish(text: string, reason?: SessionEvent<'turn/end'>['data']['reason']): Promise<void> {
       // The answer is the lossless terminal contract, so it is not truncated.
-      if (disposed) return
-      sink.write(`${JSON.stringify({ type: 'final', sessionId: agent.id, reason: reason ?? null, text })}\n`)
+      if (disposed) return Promise.resolve()
+      return emit(`${JSON.stringify({ type: 'final', sessionId: agent.id, reason: reason ?? null, text })}\n`)
     },
     dispose(): void {
       disposed = true
       stopSession()
+    },
+    settled(): Promise<void> {
+      return tail
     },
   }
 }
