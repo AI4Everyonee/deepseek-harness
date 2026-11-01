@@ -405,7 +405,10 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
     setApprovalPolicy(agent.session, approvalPolicy)
   }
   const firstSeq = agent.session.seq
-  const projection = config.json === true ? projectJsonRun(ctx, agent, io.stdout, { cwd }) : undefined
+  const projection = config.json === true ? projectJsonRun(ctx, agent, io.stdout, {
+    cwd,
+    onWriteError: (error) => { io.stderr.write(`dsh: failed to write a --json line: ${error instanceof Error ? error.message : String(error)}\n`) },
+  }) : undefined
   const stopReasoning = projection === undefined ? streamReasoning(ctx, agent, io.stderr) : undefined
   let failure: { error: unknown; atOffset: SessionLogOffset } | undefined
   const stopErrors = ctx.on('agent/error', ({ agent: subject, error }) => {
@@ -436,7 +439,7 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
     if (failure !== undefined) throw failure.error
     const outcome = summarize(agent.session, firstSeq)
     if (projection === undefined) io.stdout.write(outcome.text + '\n')
-    else projection.finish(outcome.text, outcome.reason)
+    else await projection.finish(outcome.text, outcome.reason)
     if (outcome.reason?.kind === 'error') {
       io.stderr.write(`dsh: ${outcome.reason.error.code}: ${outcome.reason.error.message}\n`)
     }
@@ -444,6 +447,8 @@ async function run(ctx: Context, config: Config, io: HeadlessIo): Promise<void> 
   } finally {
     stopErrors()
     stopTerminals()
+    // A pending tool_result must land before fail() writes the error line.
+    await projection?.settled()
     projection?.dispose()
   }
 }

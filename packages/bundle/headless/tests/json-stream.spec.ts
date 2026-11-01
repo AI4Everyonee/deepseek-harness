@@ -1,13 +1,19 @@
 /** The `--json` run projection: commit-point emission, ordering, bounding, and disposal. */
 
-import { describe, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { SpillLocator, type SaveTextSpill, type SpillStore } from '@deepseek-ai/dsh-spill'
 import { boundJsonLine, MAX_STRING_BYTES, projectJsonRun, type JsonProjectionOptions } from '../src/json-stream.ts'
 
 interface ProjectionHarness {
   readonly lines: string[]
+  readonly spillCalls: SaveTextSpill[]
   readonly projection: ReturnType<typeof projectJsonRun>
   readonly agent: Agent
   readonly session: Session
@@ -47,6 +53,16 @@ function stepEnd(): SessionEvent {
   return { type: 'step/end', data: { turn: 1, step: 1 } } as unknown as SessionEvent
 }
 
+/** One event of the given type carrying `data` as-is, cast once for events the typed builders do not cover. */
+function plainEvent(type: string, data: object): SessionEvent {
+  return { type, data } as SessionEvent
+}
+
+/** One tool call event naming the tool behind a later result. */
+function toolCall(callId: string, name: string): SessionEvent {
+  return plainEvent('tool/call', { turn: 1, step: 1, callId, name, arguments: '{}' })
+}
+
 /** One tool result event with the given surface placement. */
 function toolResult(
   callId: string,
@@ -69,22 +85,30 @@ function harness(
   options: JsonProjectionOptions = {},
   agentId = 'session-1',
   cwd: string | null = '/',
+  spillStore?: Pick<SpillStore, 'saveText'>,
+  /** Replaces the recording sink write, e.g. to make it throw. */
+  sinkWrite?: (chunk: string) => void,
 ): ProjectionHarness {
+  const spillCalls: SaveTextSpill[] = []
   const lines: string[] = []
   const sessionListeners = new Set<(session: unknown, event: SessionEvent) => void>()
   const ctx = {
+    get: (name: string) => name === 'spillStore' && spillStore !== undefined
+      ? { saveText: (input: SaveTextSpill) => { spillCalls.push(input); return spillStore.saveText(input) } }
+      : undefined,
     on(name: string, handler: unknown) {
       if (name === 'session/event') sessionListeners.add(handler as never)
       return () => { sessionListeners.delete(handler as never) }
     },
-  } as unknown as Context
-  const session = {} as Session
+  } as Pick<Context, 'get' | 'on'> as Context
+  const session = { header: { id: agentId } } as Pick<Session, 'header'> as Session
   const agent = { id: agentId, session } as unknown as Agent
   const projection = projectJsonRun(ctx, agent, {
-    write: (chunk: string) => { lines.push(chunk); return true },
+    write: (chunk: string) => { (sinkWrite ?? ((line) => { lines.push(line) }))(chunk); return true },
   }, { ...options, ...cwd === null ? {} : { cwd } })
   return {
     lines,
+    spillCalls,
     projection,
     agent,
     session,
@@ -176,7 +200,7 @@ describe('--json projection', () => {
         },
       },
     } as unknown as SessionEvent)
-    test.projection.finish('done')
+    void test.projection.finish('done')
     const events = test.parsed()
     expect(events[1]).toEqual({ type: 'tool_result', callId: 'c1', status: 'completed', result: 'a.txt' })
     expect(events[2]).toEqual({ type: 'tool_result', callId: 'c2', status: 'error', result: 'boom' })
@@ -412,19 +436,19 @@ describe('--json projection', () => {
 
   it('writes the terminal final event without bounding its answer', () => {
     const test = harness({ maxStringBytes: 4 })
-    test.projection.finish('abcdefgh')
+    void test.projection.finish('abcdefgh')
     expect(test.parsed().at(-1)).toEqual({ type: 'final', sessionId: 'session-1', reason: null, text: 'abcdefgh' })
   })
 
   it('retains the durable completion reason and exact identity in the final record', () => {
     const test = harness({ maxStringBytes: 4 }, 'session-exact')
-    test.projection.finish('answer', { kind: 'completed' })
+    void test.projection.finish('answer', { kind: 'completed' })
     expect(test.parsed().at(-1)).toEqual({ type: 'final', sessionId: 'session-exact', reason: { kind: 'completed' }, text: 'answer' })
   })
 
   it('reports an interrupted task separately from its earlier assistant text', () => {
     const test = harness()
-    test.projection.finish('I will start by reading the files.', { kind: 'aborted', reason: { kind: 'user' } })
+    void test.projection.finish('I will start by reading the files.', { kind: 'aborted', reason: { kind: 'user' } })
     expect(test.parsed().at(-1)).toMatchObject({ reason: { kind: 'aborted', reason: { kind: 'user' } } })
   })
 
@@ -433,7 +457,7 @@ describe('--json projection', () => {
     test.emitRawSession({}, assistantMessage([{ type: 'text', text: 'foreign' }]))
     test.projection.dispose()
     test.emitSession(assistantMessage([{ type: 'text', text: 'late' }]))
-    test.projection.finish('ignored')
+    void test.projection.finish('ignored')
     expect(test.parsed().map(event => event.type)).toEqual(['session'])
   })
 
@@ -441,5 +465,195 @@ describe('--json projection', () => {
     expect(JSON.parse(boundJsonLine({ type: 'error', message: 'x'.repeat(20) }, 8, 4096)))
       .toEqual({ type: 'error', message: 'xxxxxxxx', truncated: true })
     expect(JSON.parse(boundJsonLine({ type: 'error', message: 'ok' }))).toEqual({ type: 'error', message: 'ok' })
+  })
+})
+
+describe('truncated tool_result fullOutput', () => {
+  const dirs: string[] = []
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
+  })
+
+  /** A spill store writing each text to a fresh file in a temp directory. */
+  async function fileStore(): Promise<{ store: Pick<SpillStore, 'saveText'>; dir: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'json-stream-spill-'))
+    dirs.push(dir)
+    let n = 0
+    return {
+      dir,
+      store: {
+        saveText: async (input) => {
+          const path = join(dir, `${n++}-${input.suggestedName}`)
+          await writeFile(path, input.content, { mode: 0o600 })
+          return { locator: SpillLocator(path), bytes: Buffer.byteLength(input.content), retrievalHint: 'Use read.' }
+        },
+      },
+    }
+  }
+
+  it('points a 40 KB result at a file holding the exact text', async () => {
+    const { store } = await fileStore()
+    const test = harness({}, 'session-1', '/', store)
+    const full = 'é'.repeat(20_000)
+    test.emitSession(toolCall('c1', 'bash'))
+    test.emitSession(toolResult('c1', [{ type: 'text', text: full }]))
+    await test.projection.finish('done')
+    const results = test.parsed().filter(event => event.type === 'tool_result')
+    expect(results).toHaveLength(1)
+    const event = results[0]!
+    expect(event.truncated).toBe(true)
+    const output = event.fullOutput as { path: string; bytes: number; sha256: string }
+    expect(Object.keys(output).sort()).toEqual(['bytes', 'path', 'sha256'])
+    const bytes = await readFile(output.path)
+    expect(bytes.toString('utf8')).toBe(full)
+    expect(output.bytes).toBe(bytes.length)
+    expect(output.sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
+    expect(test.spillCalls[0]).toMatchObject({ owner: { sessionId: 'session-1' }, source: { kind: 'tool', toolName: 'bash', callId: 'c1' } })
+    expect(Buffer.byteLength(test.lines.find(line => line.includes('tool_result'))!)).toBeLessThanOrEqual(32 * 1024)
+    expect(test.parsed().at(-1)?.type).toBe('final')
+  })
+
+  it('keeps stream order while the file is written', async () => {
+    const { store } = await fileStore()
+    const test = harness({}, 'session-1', '/', store)
+    test.emitSession(toolResult('big', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    test.emitSession(toolResult('small', [{ type: 'text', text: 'ok' }]))
+    expect(test.parsed().map(event => event.type)).toEqual(['session'])
+    await test.projection.finish('done')
+    expect(test.parsed().map(event => event.callId ?? event.type)).toEqual(['session', 'big', 'small', 'final'])
+  })
+
+  it('gives a short result no fullOutput', async () => {
+    const { store } = await fileStore()
+    const test = harness({}, 'session-1', '/', store)
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'short' }]))
+    expect(test.parsed()[1]).toEqual({ type: 'tool_result', callId: 'c1', status: 'completed', result: 'short' })
+    expect(test.spillCalls).toHaveLength(0)
+  })
+
+  it('omits fullOutput without throwing when the write fails', async () => {
+    const test = harness({}, 'session-1', '/', { saveText: () => Promise.reject(new Error('ENOSPC')) })
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    await test.projection.finish('done')
+    const event = test.parsed()[1]!
+    expect(event.truncated).toBe(true)
+    expect(event).not.toHaveProperty('fullOutput')
+  })
+
+  it('omits fullOutput when no spill store is composed', async () => {
+    const test = harness()
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    await test.projection.finish('done')
+    expect(test.parsed()[1]).toMatchObject({ truncated: true })
+    expect(test.parsed()[1]).not.toHaveProperty('fullOutput')
+  })
+
+  it('never points fullOutput at a path named inside the result text', async () => {
+    const { store, dir } = await fileStore()
+    const secret = join(dir, 'credentials.txt')
+    await writeFile(secret, 'secret')
+    const text = `${'preview '.repeat(2000)}\n\n(Omitted 1 bytes. Full formatted result stored at: ${secret}. Use read.)`
+    const test = harness({}, 'session-1', '/', store)
+    test.emitSession(toolResult('c1', [{ type: 'text', text }]))
+    await test.projection.finish('done')
+    expect(test.spillCalls).toHaveLength(1)
+    const output = test.parsed()[1]!.fullOutput as { path: string; bytes: number; sha256: string }
+    expect(output.path).not.toBe(secret)
+    expect(await readFile(output.path, 'utf8')).toBe(text)
+    expect(output.bytes).toBe(Buffer.byteLength(text))
+  })
+
+  it('omits fullOutput when the store returns a non-absolute locator', async () => {
+    const test = harness({}, 'session-1', '/', {
+      saveText: () => Promise.resolve({ locator: SpillLocator('relative/file.txt'), bytes: 1, retrievalHint: 'Use read.' }),
+    })
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    await test.projection.finish('done')
+    expect(test.parsed()[1]).toMatchObject({ truncated: true })
+    expect(test.parsed()[1]).not.toHaveProperty('fullOutput')
+  })
+
+  it('settles a pending tool_result before a later error line', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const test = harness({}, 'session-1', '/', {
+      saveText: async (input) => {
+        await gate
+        return { locator: SpillLocator('/spill/out.txt'), bytes: Buffer.byteLength(input.content), retrievalHint: 'Use read.' }
+      },
+    })
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    expect(test.parsed().map(event => event.type)).toEqual(['session'])
+    const settled = test.projection.settled().then(() => { test.lines.push(`${JSON.stringify({ type: 'error', message: 'boom' })}\n`) })
+    release()
+    await settled
+    expect(test.parsed().map(event => event.type)).toEqual(['session', 'tool_result', 'error'])
+  })
+
+  it('keeps writing later lines after a sink write throws and reports it', async () => {
+    const errors: unknown[] = []
+    const written: string[] = []
+    let writes = 0
+    const test = harness({ onWriteError: error => errors.push(error) }, 'session-1', '/', undefined, (chunk) => {
+      if (++writes === 2) throw new Error('EPIPE')
+      written.push(chunk)
+    })
+    test.emitSession(toolResult('lost', [{ type: 'text', text: 'a' }]))
+    test.emitSession(toolResult('kept', [{ type: 'text', text: 'b' }]))
+    await test.projection.finish('done')
+    expect(errors).toHaveLength(1)
+    expect(written.map(line => (JSON.parse(line) as { callId?: string; type: string }).callId ?? 'x'))
+      .toEqual(['x', 'kept', 'x'])
+  })
+
+  it('keeps writing later lines after a queued line fails to write and reports it', async () => {
+    const errors: unknown[] = []
+    const written: string[] = []
+    let writes = 0
+    const { store } = await fileStore()
+    const test = harness({ onWriteError: error => errors.push(error) }, 'session-1', '/', store, (chunk) => {
+      if (++writes === 2) throw new Error('EPIPE')
+      written.push(chunk)
+    })
+    test.emitSession(toolResult('big', [{ type: 'text', text: 'x'.repeat(40_000) }]))
+    test.emitSession(toolResult('small', [{ type: 'text', text: 'ok' }]))
+    await test.projection.finish('done')
+    expect(errors).toHaveLength(1)
+    expect(written.map(line => (JSON.parse(line) as { callId?: string }).callId ?? 'x')).toEqual(['x', 'small', 'x'])
+  })
+
+  it('keeps fullOutput unbounded and inside the line cap', async () => {
+    const { store } = await fileStore()
+    const test = harness({ maxStringBytes: 16 }, 'session-1', '/', store)
+    test.emitSession(toolResult('c1', [{ type: 'text', text: 'x'.repeat(100) }]))
+    await test.projection.finish('done')
+    const line = test.lines[1]!
+    const output = (JSON.parse(line) as { fullOutput: { path: string } }).fullOutput
+    expect(output.path.length).toBeGreaterThan(16)
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(32 * 1024)
+  })
+
+  it('keeps callId, status and fullOutput when escapes push the scalars past the line cap', async () => {
+    const { store } = await fileStore()
+    const test = harness({}, 'session-1', '/', store)
+    const text = '\u0001'.repeat(20_000)
+    test.emitSession(toolCall('c1', 'bash'))
+    test.emitSession(toolResult('c1', [{ type: 'text', text }]))
+    await test.projection.finish('done')
+    const line = test.lines.find(l => l.includes('tool_result'))!
+    expect(Buffer.byteLength(line)).toBeLessThanOrEqual(32 * 1024)
+    const parsed = JSON.parse(line) as { callId: string; status: string; fullOutput: { path: string } }
+    expect(parsed).toMatchObject({ type: 'tool_result', callId: 'c1', status: 'completed', truncated: true })
+    expect(await readFile(parsed.fullOutput.path, 'utf8')).toBe(text)
+  })
+
+  it('keeps fullOutput when structured fields overflow the line cap', () => {
+    const line = boundJsonLine({
+      type: 'tool_result', result: 'r', error: { a: 'x'.repeat(8000), b: 'x'.repeat(8000), c: 'x'.repeat(8000), d: 'x'.repeat(8000), e: 'x'.repeat(8000) },
+      fullOutput: { path: '/p', bytes: 1, sha256: 'ab' },
+    })
+    expect(JSON.parse(line)).toEqual({
+      type: 'tool_result', result: 'r', fullOutput: { path: '/p', bytes: 1, sha256: 'ab' }, truncated: true,
+    })
   })
 })
